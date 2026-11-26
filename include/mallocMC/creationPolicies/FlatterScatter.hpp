@@ -167,6 +167,13 @@ namespace mallocMC::CreationPolicies::FlatterScatterAlloc
         template<typename AlpakaAcc>
         ALPAKA_FN_INLINE ALPAKA_FN_ACC auto create(AlpakaAcc const& acc, uint32_t const bytes) -> void*
         {
+            // A zero-byte request is not an allocation. XMallocSIMD relies on this: the non-leader threads of a
+            // coalesced warp request pass zero here and must receive nullptr without scanning any access block or
+            // touching any metadata.
+            if(bytes == 0U)
+            {
+                return nullptr;
+            }
             auto blockValue = block;
             auto hashValue = T_HashConfig::template hash<T_HeapConfig::pagesize>(acc, bytes);
             auto startIdx = startBlockIndex(acc, blockValue, hashValue);
@@ -390,11 +397,15 @@ namespace mallocMC::CreationPolicies
          * @brief Check if a pointer returned from `create()` signals out-of-memory.
          *
          * @param pointer Pointer returned by `create()`.
+         * @param size Number of bytes that were requested.
          * @return The boolean answer to this question.
          */
-        ALPAKA_FN_INLINE ALPAKA_FN_ACC static auto isOOM(void* pointer, uint32_t const /*unused size*/) -> bool
+        ALPAKA_FN_INLINE ALPAKA_FN_ACC static auto isOOM(void* pointer, uint32_t const size) -> bool
         {
-            return pointer == nullptr;
+            // Only a request that actually asked for memory can be out of memory. Non-leader threads of a coalesced
+            // XMallocSIMD request pass size == 0 and receive nullptr by design; that is not an OOM condition and must
+            // not be forwarded to the OOM policy.
+            return size != 0U && pointer == nullptr;
         }
 
         /**
