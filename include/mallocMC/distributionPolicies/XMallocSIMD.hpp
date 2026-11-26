@@ -151,10 +151,21 @@ namespace mallocMC
                     warp_sizecounter[warpid] = 16;
 
                 // second half: make sure that all coalesced allocations can fit
-                // within one page necessary for offset calculation
-                bool const coalescible = bytes > 0 && bytes < (pagesize / 32);
-
+                // within one page necessary for offset calculation.
+                //
+                // The warp-wide counter starts at 16 (the chunk header) and each participating lane adds its
+                // (padded) request. Bounding a single request by pagesize / warpSize keeps the total strictly below
+                // one page: at most warpSize lanes participate, so 16 + warpSize * (pagesize / warpSize - 1)
+                // <= pagesize - warpSize + 16 < pagesize. The old constant 32 assumed a 32-wide warp; on a wave64
+                // device up to 64 lanes participate and the sum could reach or exceed pagesize, so a coalesced
+                // allocation could spill onto a second page.
+                bool coalescible = false;
 #if (MALLOCMC_DEVICE_COMPILE)
+                // HIP defines MALLOCMC_DEVICE_COMPILE in the host pass too, where getWarpSize() is zero. The host
+                // code is not executed; keep the divisor value-dependent so the discarded branch forms no division
+                // by zero.
+                if constexpr(getWarpSize<AlpakaAcc>() > 0)
+                    coalescible = bytes > 0 && bytes < (pagesize / getWarpSize<AlpakaAcc>());
                 threadcount = alpaka::popcount(acc, alpaka::warp::ballot(acc, coalescible));
 #else
                 threadcount = 1; // TODO
