@@ -242,6 +242,13 @@ namespace mallocMC::CreationPolicies::FlatterScatterAlloc
             uint32_t const numBytes,
             uint32_t const hashValue = 0U) -> void*
         {
+            // A zero-byte request is not an allocation. XMallocSIMD relies on this: the non-leader threads of a
+            // coalesced warp request pass zero here and must receive nullptr without touching any metadata.
+            // (Without this guard, `numChunks(0)` below would divide by zero.)
+            if(numBytes == 0U)
+            {
+                return nullptr;
+            }
             void* pointer{nullptr};
             if(numBytes >= multiPageThreshold())
             {
@@ -288,13 +295,63 @@ namespace mallocMC::CreationPolicies::FlatterScatterAlloc
                 return;
             }
             auto const chunkSize = atomicLoad(acc, pageTable.chunkSizes[index]);
+            if(chunkSize == 0U)
+            {
+                // The page was already freed (or the pointer is invalid). Bail out before dividing by chunkSize
+                // below, and do not touch any metadata: a page with chunkSize == 0 is not ours to release.
+#if (!defined(NDEBUG) && !ALPAKA_LANG_CUDA && !ALPAKA_LANG_HIP)
+                throw std::runtime_error{
+                    "Attempted to destroy a pointer on a page with chunkSize==0. Likely this page was recently "
+                    "(and potentially pre-maturely) freed."};
+#endif // NDEBUG
+                return;
+            }
+
+            // XMallocSIMD coalesces the requests of a warp into one chunk: its leader allocates the summed request
+            // including a 16-byte header that holds the number of participants, and every participant receives a
+            // pointer into that chunk, namely `chunkBase + headerOffset + ...`. The chunk base itself is never handed
+            // out. Chunks always start at multiples of the page's chunk size: in chunked mode these are the chunk
+            // slots, and in single-page multi-page mode the chunk starts at the page base (offset 0). A single
+            // formula therefore identifies the base for both. A pointer that is not chunk-aligned is a coalesced
+            // sub-pointer, whose free has to decrement the participant counter at the chunk base. Only the
+            // participant that observes the counter drop from one to zero may free the chunk; all others must leave
+            // the page and its metadata completely untouched.
+            //
+            // Allocations spanning more than one page cannot originate from XMallocSIMD. It bounds each lane's
+            // request by pagesize / warpSize, which keeps the coalesced total strictly below one page for every
+            // supported warp size (including wave64), so for multi-page chunks we only accept the page-aligned base
+            // and fail safely otherwise.
+            void* chunk = pointer;
+            if(chunkSize < pageSize)
+            {
+                chunk = coalescedChunkBase(pointer, index, chunkSize);
+                if(chunk != pointer)
+                {
+                    uint32_t const oldCounter = alpaka::atomicSub(acc, static_cast<uint32_t*>(chunk), 1U);
+                    if(oldCounter != 1U)
+                    {
+                        // Another participant of this coalesced allocation is still alive.
+                        return;
+                    }
+                }
+            }
+            else if(static_cast<void*>(pages[index].data) != pointer)
+            {
+#if (!defined(NDEBUG) && !ALPAKA_LANG_CUDA && !ALPAKA_LANG_HIP)
+                throw std::runtime_error{
+                    "Attempted to destroy a pointer to a multi-page allocation that is not page-aligned. Such a "
+                    "pointer cannot have been returned by create()."};
+#endif // NDEBUG
+                return;
+            }
+
             if(chunkSize >= multiPageThreshold())
             {
                 destroyOverMultiplePages(acc, index, chunkSize);
             }
             else
             {
-                destroyChunk(acc, pointer, index, chunkSize);
+                destroyChunk(acc, chunk, index, chunkSize);
             }
         }
 
@@ -330,6 +387,48 @@ namespace mallocMC::CreationPolicies::FlatterScatterAlloc
         ALPAKA_FN_INLINE ALPAKA_FN_ACC auto interpret(uint32_t const pageIndex, uint32_t const chunkSize)
         {
             return MyPageInterpretation(pages[pageIndex], chunkSize);
+        }
+
+        /**
+         * @brief Compute the offset of a pointer relative to the start of the data of the page it points to.
+         *
+         * @param pointer Pointer inside the given page.
+         * @param pageIndex Index of the page the pointer points to.
+         * @return Byte offset of the pointer within the page.
+         */
+        ALPAKA_FN_INLINE ALPAKA_FN_ACC auto offsetInPage(void* const pointer, uint32_t const pageIndex) -> uint32_t
+        {
+            return static_cast<uint32_t>(static_cast<char*>(pointer) - static_cast<char*>(pages[pageIndex].data));
+        }
+
+        /**
+         * @brief Compute the base pointer of a potentially coalesced chunk.
+         *
+         * Chunks start at multiples of the page's chunk size (see PageInterpretation::chunkPointer), and a page in
+         * multi-page mode that fits onto a single page starts at the page boundary. A pointer whose in-page offset is
+         * not a multiple of the chunk size is therefore a sub-pointer handed out by a distribution policy such as
+         * XMallocSIMD. In that case, the chunk base is the multiple of the chunk size below the pointer. Otherwise,
+         * the pointer itself is the base.
+         *
+         * The caller has to ensure that chunkSize is non-zero.
+         *
+         * @param pointer Pointer to examine.
+         * @param pageIndex Index of the page the pointer points to.
+         * @param chunkSize Chunk size currently set on that page.
+         * @return Base pointer of the chunk the pointer belongs to.
+         */
+        ALPAKA_FN_INLINE ALPAKA_FN_ACC auto coalescedChunkBase(
+            void* const pointer,
+            uint32_t const pageIndex,
+            uint32_t const chunkSize) -> void*
+        {
+            char* const pageBase = pages[pageIndex].data;
+            auto const offset = offsetInPage(pointer, pageIndex);
+            if(offset % chunkSize == 0U)
+            {
+                return pointer;
+            }
+            return pageBase + (offset / chunkSize) * chunkSize;
         }
 
         /**

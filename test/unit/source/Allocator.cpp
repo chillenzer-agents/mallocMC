@@ -73,9 +73,9 @@ TEST_CASE("Allocator")
 // AccCpuSerial because coalescing is device-only and this suite is CPU-only.
 using XMallocAcc = alpaka::AccCpuSerial<Dim, Idx>;
 
-// XMallocSIMD is only compatible with CreationPolicies::Scatter: Scatter treats a zero-byte request as no allocation
-// and implements the deallocation of coalesced sub-chunks, both of which XMallocSIMD relies on. FlatterScatter does
-// neither. Both policies have to agree on the page size (see mallocMC_constraints.hpp).
+// Both creation policies support XMallocSIMD: both treat a zero-byte request as no allocation and both release
+// coalesced sub-chunks only when their last participant leaves. The creation and distribution policy have to agree on
+// the page size (see mallocMC_constraints.hpp).
 struct XMallocScatterConfig
 {
     static constexpr std::uint32_t pagesize = 4096U;
@@ -87,15 +87,35 @@ struct XMallocScatterConfig
 
 using XMallocScatter = mallocMC::CreationPolicies::Scatter<XMallocScatterConfig>;
 
-// The distinct names are what makes the two runs distinguishable in Catch2's output.
-struct ScatterNoop
+// FlatterScatter has to use the same page size as XMallocSIMD (4096 bytes by default). An access block size of 1 MiB
+// makes the 4 MiB heap below hold four full access blocks.
+using XMallocFlatterScatterConfig
+    = mallocMC::CreationPolicies::FlatterScatterAlloc::DefaultHeapConfig<1024U * 1024U, 4096U, 2U>;
+using XMallocFlatterScatter = mallocMC::CreationPolicies::FlatterScatter<XMallocFlatterScatterConfig>;
+
+// The distinct names are what makes the four runs distinguishable in Catch2's output.
+template<typename T_CreationPolicy, typename T_DistributionPolicy>
+struct AllocatorPolicies
 {
-    using DistributionPolicy = mallocMC::DistributionPolicies::Noop;
+    using CreationPolicy = T_CreationPolicy;
+    using DistributionPolicy = T_DistributionPolicy;
 };
 
-struct ScatterXMallocSIMD
+struct ScatterNoop : AllocatorPolicies<XMallocScatter, mallocMC::DistributionPolicies::Noop>
 {
-    using DistributionPolicy = mallocMC::DistributionPolicies::XMallocSIMD<>;
+};
+
+struct ScatterXMallocSIMD : AllocatorPolicies<XMallocScatter, mallocMC::DistributionPolicies::XMallocSIMD<>>
+{
+};
+
+struct FlatterScatterNoop : AllocatorPolicies<XMallocFlatterScatter, mallocMC::DistributionPolicies::Noop>
+{
+};
+
+struct FlatterScatterXMallocSIMD
+    : AllocatorPolicies<XMallocFlatterScatter, mallocMC::DistributionPolicies::XMallocSIMD<>>
+{
 };
 
 struct AllocateWriteCheckAndFree
@@ -104,8 +124,10 @@ struct AllocateWriteCheckAndFree
     ALPAKA_FN_ACC auto operator()(TAcc const& acc, TAllocatorHandle allocHandle, std::uint32_t* results) const -> void
     {
         constexpr std::uint32_t numBytes = 32U;
-        // XMallocSIMD only coalesces requests smaller than pagesize / 32.
-        static_assert(numBytes < mallocMC::DistributionPolicies::XMallocSIMD<>::Properties::pagesize / 32U);
+        // XMallocSIMD only coalesces requests smaller than pagesize / warpSize. Bounding by pagesize / 64 keeps
+        // 32 bytes coalescible for both a 32-wide and a 64-wide warp. This CPU-only test still cannot coalesce,
+        // because coalescing is a device-only code path.
+        static_assert(numBytes < mallocMC::DistributionPolicies::XMallocSIMD<>::Properties::pagesize / 64U);
 
         auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];
         void* const pointer = allocHandle.malloc(acc, numBytes);
@@ -133,12 +155,19 @@ struct AllocateWriteCheckAndFree
     }
 };
 
-TEMPLATE_TEST_CASE("Allocator allocates and frees", "", ScatterNoop, ScatterXMallocSIMD)
+TEMPLATE_TEST_CASE(
+    "Allocator allocates and frees",
+    "",
+    ScatterNoop,
+    ScatterXMallocSIMD,
+    FlatterScatterNoop,
+    FlatterScatterXMallocSIMD)
 {
+    using CreationPolicy = typename TestType::CreationPolicy;
     using DistributionPolicy = typename TestType::DistributionPolicy;
     using Allocator = mallocMC::Allocator<
         alpaka::AccToTag<XMallocAcc>,
-        XMallocScatter,
+        CreationPolicy,
         DistributionPolicy,
         mallocMC::OOMPolicies::ReturnNull,
         mallocMC::ReservePoolPolicies::AlpakaBuf<XMallocAcc>,
@@ -148,7 +177,8 @@ TEMPLATE_TEST_CASE("Allocator allocates and frees", "", ScatterNoop, ScatterXMal
     auto const dev = alpaka::getDevByIdx(platform, 0);
     auto queue = alpaka::Queue<XMallocAcc, alpaka::Blocking>{dev};
 
-    // Scatter needs a heap that holds at least one full access block to initialise.
+    // Both creation policies need a heap that holds at least one full access block and is a multiple of the access
+    // block size. With 1 MiB access blocks, this 4 MiB heap holds four of them.
     constexpr std::size_t heapSize = 4U * 1024U * 1024U;
     Allocator allocator{dev, queue, heapSize};
 
