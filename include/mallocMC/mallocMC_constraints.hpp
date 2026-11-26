@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include "creationPolicies/FlatterScatter.hpp"
 #include "creationPolicies/Scatter.hpp"
 #include "distributionPolicies/XMallocSIMD.hpp"
+
+#include <cstdint>
 
 namespace mallocMC
 {
@@ -80,12 +83,36 @@ namespace mallocMC
      *
      * This constraint ensures that if the CreationPolicy "Scatter" and the
      * DistributionPolicy "XMallocSIMD" are selected, they are configured to use
-     * the same value for their "pagesize"-parameter.
+     * the same value for their "pagesize"-parameter. The comparison uses the
+     * effective `_pagesize` of both policies, so a command-line override such as
+     * -DMALLOCMC_CP_SCATTER_PAGESIZE or -DMALLOCMC_DP_XMALLOCSIMD_PAGESIZE is
+     * reflected on either side.
      */
     template<typename x, typename y, typename z>
     class PolicyCheck2<typename CreationPolicies::Scatter<x, y>, typename DistributionPolicies::XMallocSIMD<z>>
     {
-        static_assert(x::pagesize == z::pagesize, "Pagesize must be the same when combining Scatter and XMallocSIMD");
+        static_assert(
+            CreationPolicies::ScatterImpl<x, y, void>::_pagesize == DistributionPolicies::XMallocSIMD<z>::_pagesize,
+            "Pagesize must be the same when combining Scatter and XMallocSIMD");
+    };
+
+    /** FlatterScatter and XMallocSIMD need the same pagesize!
+     *
+     * This constraint ensures that if the CreationPolicy "FlatterScatter" and the DistributionPolicy "XMallocSIMD"
+     * are selected, they are configured to use the same value for their "pagesize"-parameter. XMallocSIMD decides
+     * which requests to coalesce and lays out the sub-pointers based on its own page size, so it must match the page
+     * size the FlatterScatter heap is actually using. The comparison uses XMallocSIMD's effective `_pagesize`, which
+     * also reflects a command-line override such as -DMALLOCMC_DP_XMALLOCSIMD_PAGESIZE.
+     */
+    template<typename T_HeapConfig, typename T_HashConfig, typename T_AlignmentPolicy, typename T_XMallocSIMDConfig>
+    class PolicyCheck2<
+        CreationPolicies::FlatterScatter<T_HeapConfig, T_HashConfig, T_AlignmentPolicy>,
+        DistributionPolicies::XMallocSIMD<T_XMallocSIMDConfig>>
+    {
+        static_assert(
+            static_cast<std::uint32_t>(T_HeapConfig::pagesize)
+                == DistributionPolicies::XMallocSIMD<T_XMallocSIMDConfig>::_pagesize,
+            "Pagesize must be the same when combining FlatterScatter and XMallocSIMD");
     };
 
 } // namespace mallocMC

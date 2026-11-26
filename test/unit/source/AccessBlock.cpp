@@ -537,6 +537,101 @@ TEMPLATE_LIST_TEST_CASE("AccessBlock", "", AccessBlocks)
             }
         }
     }
+
+    SECTION("creates no allocation for zero bytes and leaves the metadata untouched.")
+    {
+        // XMallocSIMD asks non-participating threads for zero bytes. That must be a no-op.
+        auto const slots = accessBlock.getAvailableSlots(accSerial, chunkSize);
+        CHECK(accessBlock.create(accSerial, 0U) == nullptr);
+        CHECK(accessBlock.getAvailableSlots(accSerial, chunkSize) == slots);
+
+        // It must not disturb an already used block either.
+        void* const pointer = accessBlock.create(accSerial, chunkSize);
+        REQUIRE(pointer != nullptr);
+        auto const slotsAfterAllocation = accessBlock.getAvailableSlots(accSerial, chunkSize);
+        CHECK(accessBlock.create(accSerial, 0U) == nullptr);
+        CHECK(accessBlock.getAvailableSlots(accSerial, chunkSize) == slotsAfterAllocation);
+        CHECK(accessBlock.isValid(accSerial, pointer));
+    }
+
+    SECTION("frees a coalesced chunk only when its last participant leaves.")
+    {
+        // This exercises the destroy protocol by manually writing the participant counter into the first four
+        // bytes of the allocation, as XMallocSIMD would. The 32-byte participant requests are not XMalloc-realisable
+        // for every fixture page size (32 < pageSize / 64 fails once pageSize is 1024), so this test does not claim
+        // XMallocSIMD would coalesce these exact sizes. `totalSize < pageSize / 2` keeps the chunk in chunked mode.
+        constexpr uint32_t const bytesPerParticipant = 32U;
+        constexpr uint32_t const totalSize = 16U + 2U * bytesPerParticipant;
+        constexpr uint32_t const numParticipants = 2U;
+        REQUIRE(totalSize < pageSize / 2U);
+
+        auto const initialSlots = accessBlock.getAvailableSlots(accSerial, totalSize);
+
+        auto* const base = static_cast<char*>(accessBlock.create(accSerial, totalSize));
+        REQUIRE(base != nullptr);
+        REQUIRE(accessBlock.isValid(accSerial, base));
+        *reinterpret_cast<uint32_t*>(base) = numParticipants;
+
+        auto const slotsWhileAllocated = accessBlock.getAvailableSlots(accSerial, totalSize);
+
+        auto* const firstSubPointer = base + 16U;
+        auto* const lastSubPointer = firstSubPointer + bytesPerParticipant;
+
+        SECTION("in allocation order.")
+        {
+            accessBlock.destroy(accSerial, firstSubPointer);
+            // The chunk must still be allocated because one participant is left.
+            CHECK(accessBlock.isValid(accSerial, base));
+            CHECK(accessBlock.getAvailableSlots(accSerial, totalSize) == slotsWhileAllocated);
+
+            accessBlock.destroy(accSerial, lastSubPointer);
+            CHECK(not accessBlock.isValid(accSerial, base));
+            CHECK(accessBlock.getAvailableSlots(accSerial, totalSize) == initialSlots);
+            CHECK(accessBlock.create(accSerial, totalSize) == base);
+        }
+
+        SECTION("in reverse order.")
+        {
+            accessBlock.destroy(accSerial, lastSubPointer);
+            CHECK(accessBlock.isValid(accSerial, base));
+            CHECK(accessBlock.getAvailableSlots(accSerial, totalSize) == slotsWhileAllocated);
+
+            accessBlock.destroy(accSerial, firstSubPointer);
+            CHECK(not accessBlock.isValid(accSerial, base));
+            CHECK(accessBlock.getAvailableSlots(accSerial, totalSize) == initialSlots);
+            CHECK(accessBlock.create(accSerial, totalSize) == base);
+        }
+    }
+
+    SECTION("frees coalesced sub-pointers of a single-page multi-page allocation.")
+    {
+        // A coalesced request may exceed the multi-page threshold while still fitting onto a single page. create()
+        // then places the chunk at offset 0 of the page and records chunkSize == totalSize. XMallocSIMD keeps every
+        // coalesced request strictly below one page, so this is the only multi-page case it can produce. The
+        // participant sizes here are not XMalloc-realistic; this only exercises the code path.
+        auto const totalSize = pageSize - 128U;
+        auto const bytesPerParticipant = (totalSize - 16U) / 2U;
+        REQUIRE(totalSize > pageSize / 2U);
+        REQUIRE(totalSize < pageSize);
+        REQUIRE(16U + 2U * bytesPerParticipant == totalSize);
+
+        auto const initialSlots = accessBlock.getAvailableSlots(accSerial, totalSize);
+        auto* const base = static_cast<char*>(accessBlock.create(accSerial, totalSize));
+        REQUIRE(base != nullptr);
+        REQUIRE(accessBlock.getAvailableSlots(accSerial, totalSize) == initialSlots - 1U);
+
+        *reinterpret_cast<uint32_t*>(base) = 2U;
+        auto* const firstSubPointer = base + 16U;
+        auto* const secondSubPointer = firstSubPointer + bytesPerParticipant;
+
+        // A non-last free must not release the page.
+        accessBlock.destroy(accSerial, firstSubPointer);
+        CHECK(accessBlock.getAvailableSlots(accSerial, totalSize) == initialSlots - 1U);
+
+        accessBlock.destroy(accSerial, secondSubPointer);
+        CHECK(accessBlock.getAvailableSlots(accSerial, totalSize) == initialSlots);
+        CHECK(accessBlock.create(accSerial, totalSize) == base);
+    }
 }
 
 TEST_CASE("AccessBlock (Regression)")
