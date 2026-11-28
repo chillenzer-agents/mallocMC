@@ -1,6 +1,11 @@
 Change Log / Release Log for mallocMC
 ================================================================
 
+3.1.0-dev
+-----
+
+Date: not yet released
+
 3.0.0-dev
 -----
 

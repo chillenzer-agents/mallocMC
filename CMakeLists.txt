@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.14...3.22)
 
 project(
   mallocMC
-  VERSION 3.0.0
+  VERSION 3.1.0
   LANGUAGES CXX
 )
 
